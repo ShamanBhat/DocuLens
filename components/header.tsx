@@ -1,19 +1,23 @@
 'use client';
 
 import { MessageSquareText, RotateCcw } from 'lucide-react';
-import type { ModelsStatus } from '@/hooks/use-model-selection';
-import type { ModelOption } from '@/lib/ai/models';
+import type { CloudStatus } from '@/hooks/use-model-selection';
+import { isCloudModel, type EngineModel } from '@/lib/engines';
+import type { EngineSnapshot } from '@/lib/local/engine';
 import { cn } from '@/lib/utils';
 import { ContextMeter } from './context-meter';
+import { EngineBadge } from './engine/engine-badge';
 import { Logo } from './logo';
 import { ModelSwitcher } from './model-switcher';
 
 interface HeaderProps {
-  models: ModelOption[];
+  models: EngineModel[];
   modelKey: string | null;
-  activeModel: ModelOption | null;
-  modelsStatus: ModelsStatus;
+  activeModel: EngineModel | null;
+  cloudStatus: CloudStatus;
+  engine: EngineSnapshot;
   onModelChange: (modelKey: string) => void;
+  onOpenEngine: () => void;
   hasDocuments: boolean;
   bundleTokens: number;
   chatOpen: boolean;
@@ -28,8 +32,10 @@ export function Header({
   models,
   modelKey,
   activeModel,
-  modelsStatus,
+  cloudStatus,
+  engine,
   onModelChange,
+  onOpenEngine,
   hasDocuments,
   bundleTokens,
   chatOpen,
@@ -37,15 +43,17 @@ export function Header({
   onReset,
 }: HeaderProps) {
   return (
-    <header className="relative z-40 flex h-14 shrink-0 items-center gap-3 border-b border-white/[0.06] bg-slate-950/70 px-3 backdrop-blur-xl sm:px-4">
+    <header className="relative z-40 flex h-14 shrink-0 items-center gap-2 border-b border-white/[0.06] bg-slate-950/70 px-3 backdrop-blur-xl sm:gap-3 sm:px-4">
       <Logo />
 
       <div className="ml-auto flex items-center gap-2">
-        {hasDocuments && activeModel && (
+        {/* A context meter only makes sense for cloud models: on-device audits window the text instead. */}
+        {hasDocuments && isCloudModel(activeModel) && (
           <ContextMeter tokens={bundleTokens} contextWindow={activeModel.contextWindow} className="hidden md:flex" />
         )}
 
-        <ModelSwitcher models={models} value={modelKey} onChange={onModelChange} status={modelsStatus} />
+        <EngineBadge model={activeModel} engine={engine} onClick={onOpenEngine} />
+        <ModelSwitcher models={models} value={modelKey} onChange={onModelChange} cloudStatus={cloudStatus} />
 
         {hasDocuments && (
           <>

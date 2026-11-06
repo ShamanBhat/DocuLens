@@ -8,9 +8,7 @@ export function Logo() {
       </div>
       <div className="min-w-0 leading-tight">
         <p className="text-sm font-semibold tracking-tight text-white">DocuLens</p>
-        <p className="hidden truncate text-[11px] text-slate-500 xl:block">
-          AI long-context document &amp; contract auditor
-        </p>
+        <p className="hidden truncate text-[11px] text-slate-500 xl:block">In-browser AI document &amp; contract auditor</p>
       </div>
     </div>
   );

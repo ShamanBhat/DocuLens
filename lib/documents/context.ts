@@ -48,8 +48,9 @@ function escapeAttribute(value: string): string {
  *   </document>
  *
  * Explicit page tags let any model cite exact pages, independent of printed page labels.
+ * Pass `excerpt: true` for page subsets (local retrieval) so no misleading page total is claimed.
  */
-export function serializeDocuments(documents: DocumentPayload[]): string {
+export function serializeDocuments(documents: DocumentPayload[], options: { excerpt?: boolean } = {}): string {
   return documents
     .map((doc) => {
       const pages = doc.pages
@@ -58,7 +59,8 @@ export function serializeDocuments(documents: DocumentPayload[]): string {
           return `<page number="${page.page}">\n${text}\n</page>`;
         })
         .join('\n');
-      return `<document id="${doc.id}" name="${escapeAttribute(doc.name)}" total_pages="${doc.pages.length}">\n${pages}\n</document>`;
+      const total = options.excerpt ? '' : ` total_pages="${doc.pages.length}"`;
+      return `<document id="${doc.id}" name="${escapeAttribute(doc.name)}"${total}>\n${pages}\n</document>`;
     })
     .join('\n\n');
 }

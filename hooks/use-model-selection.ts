@@ -1,11 +1,26 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import type { ModelOption } from '@/lib/ai/models';
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { MODEL_STORAGE_KEY } from '@/lib/constants';
+import { CLIENT_CONFIG } from '@/lib/config';
+import { isLocalModel, type CloudEngineModel, type EngineModel } from '@/lib/engines';
+import { getDefaultLocalModel, getLocalModels, isLocalKey } from '@/lib/local/models';
 import type { ModelsResponse } from '@/lib/types';
 
-export type ModelsStatus = 'loading' | 'ready' | 'error';
+export type CloudStatus = 'loading' | 'ready' | 'error' | 'off';
+
+// ── Persisted choice (localStorage as an external store: null on the server, real value after hydration) ──
+
+const storageListeners = new Set<() => void>();
+
+function subscribeToStorage(listener: () => void): () => void {
+  storageListeners.add(listener);
+  window.addEventListener('storage', listener);
+  return () => {
+    storageListeners.delete(listener);
+    window.removeEventListener('storage', listener);
+  };
+}
 
 function readStoredModel(): string | null {
   try {
@@ -15,13 +30,33 @@ function readStoredModel(): string | null {
   }
 }
 
-/** Loads the server-side model catalog and persists the user's choice across sessions. */
+function writeStoredModel(key: string): void {
+  try {
+    window.localStorage.setItem(MODEL_STORAGE_KEY, key);
+  } catch {
+    // Storage may be unavailable (private mode) — the choice still applies for this session.
+  }
+  storageListeners.forEach((listener) => listener());
+}
+
+const subscribeNever = () => () => undefined;
+
+/**
+ * Merges the built-in on-device catalog with the (optional) server-side cloud catalog and persists
+ * the user's choice. On-device models are always available; cloud models appear only when the
+ * server has a key. `hydrated` is true once the stored choice is resolved, so nothing (like the
+ * auto-download) starts for a model the user already moved away from.
+ */
 export function useModelSelection() {
-  const [models, setModels] = useState<ModelOption[]>([]);
-  const [modelKey, setModelKeyState] = useState<string | null>(null);
-  const [status, setStatus] = useState<ModelsStatus>('loading');
+  const localModels = useMemo(() => getLocalModels(), []);
+  const [cloudModels, setCloudModels] = useState<CloudEngineModel[]>([]);
+  const [cloudStatus, setCloudStatus] = useState<CloudStatus>(CLIENT_CONFIG.cloudFallback ? 'loading' : 'off');
+
+  const stored = useSyncExternalStore(subscribeToStorage, readStoredModel, () => null);
+  const isClient = useSyncExternalStore(subscribeNever, () => true, () => false);
 
   useEffect(() => {
+    if (!CLIENT_CONFIG.cloudFallback) return;
     const controller = new AbortController();
 
     (async () => {
@@ -29,33 +64,29 @@ export function useModelSelection() {
         const res = await fetch('/api/models', { signal: controller.signal, cache: 'no-store' });
         if (!res.ok) throw new Error(`Failed to load models (HTTP ${res.status})`);
         const data = (await res.json()) as ModelsResponse;
-
-        const stored = readStoredModel();
-        const storedIsUsable = data.models.some((m) => m.key === stored && m.available);
-
-        setModels(data.models);
-        setModelKeyState(storedIsUsable ? stored : data.defaultModelKey);
-        setStatus('ready');
+        setCloudModels(data.models.map((model): CloudEngineModel => ({ ...model, kind: 'cloud' })));
+        setCloudStatus('ready');
       } catch (error) {
         if (controller.signal.aborted) return;
-        console.error('[DocuLens] Unable to load model catalog', error);
-        setStatus('error');
+        console.error('[DocuLens] Unable to load the cloud model catalog', error);
+        setCloudStatus('error');
       }
     })();
 
     return () => controller.abort();
   }, []);
 
-  const setModelKey = useCallback((key: string) => {
-    setModelKeyState(key);
-    try {
-      window.localStorage.setItem(MODEL_STORAGE_KEY, key);
-    } catch {
-      // Storage may be unavailable (private mode) — selection still works for this session.
-    }
-  }, []);
+  const models = useMemo<EngineModel[]>(() => [...localModels, ...cloudModels], [localModels, cloudModels]);
 
-  const activeModel = useMemo(() => models.find((m) => m.key === modelKey) ?? null, [models, modelKey]);
+  const activeModel = useMemo<EngineModel>(
+    () => models.find((model) => model.key === stored && model.available) ?? getDefaultLocalModel(),
+    [models, stored],
+  );
 
-  return { models, modelKey, activeModel, setModelKey, status };
+  // A stored cloud choice can only be confirmed once the catalog has loaded.
+  const hydrated = isClient && (!stored || isLocalKey(stored) || cloudStatus !== 'loading');
+
+  const setModelKey = useCallback((key: string) => writeStoredModel(key), []);
+
+  return { models, modelKey: activeModel.key, activeModel, setModelKey, cloudStatus, hydrated, isLocal: isLocalModel(activeModel) };
 }

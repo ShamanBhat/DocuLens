@@ -1,7 +1,7 @@
 export const APP_NAME = 'DocuLens';
 
 export const TAGLINE =
-  'Enterprise long-context document analysis, cross-clause risk auditing, and grounded Q&A powered by your choice of AI model.';
+  'Enterprise long-context document analysis and risk auditing running 100% locally in your browser using WebGPU & Hugging Face.';
 
 /** Maximum number of documents in one audit bundle (enforced client- and server-side). */
 export const MAX_DOCUMENTS = 20;

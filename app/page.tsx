@@ -3,12 +3,13 @@
 /**
  * DocuLens — main dashboard.
  *
- *  ┌──────────── Header: logo · context meter · model switcher ────────────┐
- *  │ PDF viewer (bundle tabs) │ Audit dashboard (useObject) │ Q&A (useChat) │
- *  └───────────────────────────────────────────────────────────────────────┘
+ *  ┌── Header: logo · privacy/engine badge · model switcher (on-device ▸ cloud fallback) ──┐
+ *  │ PDF viewer (bundle tabs) │ Audit dashboard (local worker or cloud) │ Grounded Q&A chat │
+ *  └────────────────────────────────────────────────────────────────────────────────────────┘
+ *  + First-run overlay: live Hugging Face → browser-cache download progress for the on-device model.
  *
- * Every citation in the dashboard and chat is wired back to the viewer through
- * CitationProvider, so clicking "D2 · p.41" opens that page and highlights the quote.
+ * Every citation in the dashboard and chat is wired back to the viewer through CitationProvider,
+ * so clicking "D2 · p.41" opens that page and highlights the quote.
  */
 
 import { FileText, MessageSquareText, ShieldAlert, type LucideIcon } from 'lucide-react';
@@ -18,13 +19,24 @@ import { AnalysisDashboard } from '@/components/analysis/analysis-dashboard';
 import { ChatSidebar } from '@/components/chat/chat-sidebar';
 import { CitationProvider, type CitationNavigator } from '@/components/citation-context';
 import { DocumentTabs } from '@/components/document-tabs';
+import { ModelDownloadOverlay } from '@/components/engine/model-download-overlay';
 import { Header } from '@/components/header';
 import { Landing } from '@/components/landing';
 import { Notices } from '@/components/notices';
 import { PanelLoader } from '@/components/ui/primitives';
 import { useDocumentBundle } from '@/hooks/use-document-bundle';
+import {
+  loadLocalModel,
+  prefersDataSaving,
+  unloadLocalModel,
+  useLocalEngine,
+  useLocalEngineAutoload,
+  useWebGpuSupport,
+} from '@/hooks/use-local-engine';
 import { useModelSelection } from '@/hooks/use-model-selection';
 import { useNotices } from '@/hooks/use-notices';
+import { CLIENT_CONFIG } from '@/lib/config';
+import { isLocalModel } from '@/lib/engines';
 import type { CitationTarget } from '@/lib/types';
 import { cn } from '@/lib/utils';
 
@@ -52,20 +64,35 @@ const PANES: { id: Pane; label: string; icon: LucideIcon }[] = [
 ];
 
 export default function DocuLensPage() {
-  const { models, modelKey, activeModel, setModelKey, status: modelsStatus } = useModelSelection();
+  const { models, modelKey, activeModel, setModelKey, cloudStatus, hydrated } = useModelSelection();
   const { documents, version, ingest, addFiles, removeDocument, reset } = useDocumentBundle();
   const { notices, notify, dismiss } = useNotices();
+  const engine = useLocalEngine();
+  const webgpu = useWebGpuSupport();
 
   const [activeDocId, setActiveDocId] = useState<string | null>(null);
   const [pageByDoc, setPageByDoc] = useState<Record<string, number>>({});
   const [highlight, setHighlight] = useState<Highlight | null>(null);
   const [chatOpen, setChatOpen] = useState(true);
   const [pane, setPane] = useState<Pane>('viewer');
+  // Dismissal is remembered per model, so picking another on-device model brings the progress panel back.
+  const [dismissedModelKey, setDismissedModelKey] = useState<string | null>(null);
+
+  const localModel = isLocalModel(activeModel) ? activeModel : null;
+  const overlayDismissed = localModel !== null && dismissedModelKey === localModel.key;
+
+  // Start fetching the on-device model as soon as the app opens (first visit: Hugging Face -> browser cache).
+  useLocalEngineAutoload(localModel, hydrated);
+
+  // Data Saver / NEXT_PUBLIC_AUTO_DOWNLOAD=off defer the download until the user asks for it.
+  const deferred = useMemo(
+    () => hydrated && (!CLIENT_CONFIG.autoDownload || prefersDataSaving()),
+    [hydrated],
+  );
 
   const activeDoc = documents.find((doc) => doc.id === activeDocId) ?? documents[0] ?? null;
   const activePage = activeDoc ? (pageByDoc[activeDoc.id] ?? 1) : 1;
   const bundleTokens = useMemo(() => documents.reduce((sum, doc) => sum + doc.tokenEstimate, 0), [documents]);
-  const noProviders = modelsStatus === 'ready' && !models.some((model) => model.available);
 
   const handleFiles = useCallback(
     async (files: File[]) => {
@@ -130,6 +157,26 @@ export default function DocuLensPage() {
     setPane('viewer');
   }, [reset]);
 
+  const startDownload = useCallback(() => {
+    if (!localModel) return;
+    setDismissedModelKey(null);
+    void loadLocalModel(localModel).catch(() => undefined); // failures are shown by the overlay/badge
+  }, [localModel]);
+
+  const cancelDownload = useCallback(() => {
+    unloadLocalModel();
+    setDismissedModelKey(localModel?.key ?? null);
+  }, [localModel]);
+
+  const handleOpenEngine = useCallback(() => {
+    // Clicking the badge on an unloaded/failed model starts (or retries) the load; otherwise it just reopens the panel.
+    if (localModel && (engine.model?.key !== localModel.key || engine.phase === 'error' || engine.phase === 'idle')) {
+      startDownload();
+    } else {
+      setDismissedModelKey(null);
+    }
+  }, [engine.model?.key, engine.phase, localModel, startDownload]);
+
   const viewerHighlight =
     highlight && activeDoc && highlight.documentId === activeDoc.id && highlight.page === activePage
       ? highlight.quote
@@ -141,8 +188,10 @@ export default function DocuLensPage() {
         models={models}
         modelKey={modelKey}
         activeModel={activeModel}
-        modelsStatus={modelsStatus}
+        cloudStatus={cloudStatus}
+        engine={engine}
         onModelChange={setModelKey}
+        onOpenEngine={handleOpenEngine}
         hasDocuments={documents.length > 0}
         bundleTokens={bundleTokens}
         chatOpen={chatOpen}
@@ -151,12 +200,7 @@ export default function DocuLensPage() {
       />
 
       {documents.length === 0 ? (
-        <Landing
-          onFiles={(files) => void handleFiles(files)}
-          ingest={ingest}
-          noProviders={noProviders}
-          modelsError={modelsStatus === 'error'}
-        />
+        <Landing onFiles={(files) => void handleFiles(files)} ingest={ingest} webgpu={webgpu} />
       ) : (
         <CitationProvider value={citationNavigator}>
           {/* Small screens: one pane at a time */}
@@ -222,6 +266,17 @@ export default function DocuLensPage() {
           </main>
         </CitationProvider>
       )}
+
+      <ModelDownloadOverlay
+        engine={engine}
+        selected={localModel}
+        support={webgpu}
+        dismissed={overlayDismissed}
+        deferred={deferred}
+        onDismiss={() => setDismissedModelKey(localModel?.key ?? null)}
+        onDownload={startDownload}
+        onCancel={cancelDownload}
+      />
 
       <Notices notices={notices} onDismiss={dismiss} />
     </div>

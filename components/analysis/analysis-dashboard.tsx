@@ -8,6 +8,7 @@ import {
   CircleDollarSign,
   Download,
   LayoutDashboard,
+  Lock,
   RotateCcw,
   ShieldAlert,
   Sparkles,
@@ -16,9 +17,12 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
-import type { ModelOption } from '@/lib/ai/models';
+import { useLocalAnalysis } from '@/hooks/use-local-analysis';
+import { useLocalEngine } from '@/hooks/use-local-engine';
 import { analysisSchema } from '@/lib/ai/schemas';
 import { fitsInContext, toDocumentPayload } from '@/lib/documents/context';
+import { isCloudModel, isLocalModel, type EngineModel } from '@/lib/engines';
+import { buildWindows } from '@/lib/local/windows';
 import type { LoadedDocument, PartialAnalysis } from '@/lib/types';
 import { cn, formatTokens, readableError } from '@/lib/utils';
 import { ExecutiveSummary } from './executive-summary';
@@ -27,6 +31,7 @@ import { RiskMatrix } from './risk-matrix';
 import { TimelinePanel } from './timeline-panel';
 
 type TabId = 'overview' | 'risks' | 'financials' | 'timeline';
+type Source = 'local' | 'cloud';
 
 const TABS: { id: TabId; label: string; icon: LucideIcon }[] = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard },
@@ -35,7 +40,7 @@ const TABS: { id: TabId; label: string; icon: LucideIcon }[] = [
   { id: 'timeline', label: 'Dates & deliverables', icon: CalendarClock },
 ];
 
-/** Schema keys in reverse streaming order — the first one present is the section being generated. */
+/** Schema keys in reverse streaming order — the first one present is the section being generated (cloud). */
 const SECTION_PROGRESS: [keyof PartialAnalysis, string][] = [
   ['deliverables', 'deliverables'],
   ['keyDates', 'key dates'],
@@ -48,33 +53,42 @@ const SECTION_PROGRESS: [keyof PartialAnalysis, string][] = [
 
 interface AnalysisRun {
   modelLabel: string;
+  source: Source;
   startedAt: number;
   now: number;
 }
 
 interface AnalysisDashboardProps {
   documents: LoadedDocument[];
-  model: ModelOption | null;
+  model: EngineModel | null;
 }
 
 /**
- * Streams a schema-validated audit from /api/analyze with `useObject` and renders it
- * progressively. The same UI works for every provider because the schema is shared.
+ * Renders a schema-shaped audit and streams it in section by section. The same dashboard serves
+ * both engines: on-device runs come from `useLocalAnalysis`, cloud runs from `useObject` on /api/analyze.
  */
 export function AnalysisDashboard({ documents, model }: AnalysisDashboardProps) {
   const [tab, setTab] = useState<TabId>('overview');
   const [run, setRun] = useState<AnalysisRun | null>(null);
-  const [incomplete, setIncomplete] = useState(false);
+  const [cloudIncomplete, setCloudIncomplete] = useState(false);
+  const engine = useLocalEngine();
 
-  const { object, submit, isLoading, error, stop } = useObject({
+  const cloud = useObject({
     api: '/api/analyze',
     schema: analysisSchema,
     onFinish: ({ error: validationError }) => {
-      setIncomplete(validationError !== undefined);
+      setCloudIncomplete(validationError !== undefined);
       setRun((current) => (current ? { ...current, now: Date.now() } : current));
     },
   });
-  const analysis = object as PartialAnalysis | undefined;
+  const local = useLocalAnalysis();
+
+  // The source that produced the visible result is pinned at start, so switching models mid-run can't swap data.
+  const source: Source = run?.source ?? (isLocalModel(model) ? 'local' : 'cloud');
+  const analysis = (source === 'local' ? local.object : cloud.object) as PartialAnalysis | undefined;
+  const isLoading = source === 'local' ? local.isLoading : cloud.isLoading;
+  const error = source === 'local' ? local.error : cloud.error;
+  const stop = source === 'local' ? local.stop : cloud.stop;
 
   useEffect(() => {
     if (!isLoading) return;
@@ -82,11 +96,30 @@ export function AnalysisDashboard({ documents, model }: AnalysisDashboardProps) 
     return () => window.clearInterval(timer);
   }, [isLoading]);
 
+  const payload = useMemo(() => toDocumentPayload(documents), [documents]);
   const bundleTokens = useMemo(() => documents.reduce((sum, doc) => sum + doc.tokenEstimate, 0), [documents]);
-  const fits = model !== null && fitsInContext(bundleTokens, model.contextWindow);
+  const plan = useMemo(() => (isLocalModel(model) ? buildWindows(payload, model.promptBudget) : null), [payload, model]);
+
+  const fits = isCloudModel(model) ? fitsInContext(bundleTokens, model.contextWindow) : model !== null;
   const hasResult = analysis !== undefined && Object.keys(analysis).length > 0;
   const elapsed = run ? Math.max(0, Math.round((run.now - run.startedAt) / 1000)) : 0;
-  const currentSection = analysis ? SECTION_PROGRESS.find(([key]) => analysis[key] !== undefined)?.[1] : undefined;
+
+  const localProgress = local.progress;
+  const currentSection =
+    source === 'local'
+      ? localProgress
+        ? localProgress.stage === 'summarising'
+          ? 'executive summary'
+          : `pass ${Math.min(localProgress.done + 1, localProgress.total)}/${localProgress.total}`
+        : undefined
+      : analysis
+        ? SECTION_PROGRESS.find(([key]) => analysis[key] !== undefined)?.[1]
+        : undefined;
+
+  const incomplete =
+    source === 'local'
+      ? localProgress !== null && localProgress.skipped > 0
+      : cloudIncomplete;
 
   const counts: Partial<Record<TabId, number>> = {
     risks: (analysis?.risks?.length ?? 0) + (analysis?.conflicts?.length ?? 0) + (analysis?.gaps?.length ?? 0),
@@ -97,10 +130,16 @@ export function AnalysisDashboard({ documents, model }: AnalysisDashboardProps) 
   const start = () => {
     if (!model || isLoading) return;
     const now = Date.now();
-    setIncomplete(false);
-    setRun({ modelLabel: model.label, startedAt: now, now });
+    setCloudIncomplete(false);
     setTab('overview');
-    submit({ modelKey: model.key, documents: toDocumentPayload(documents) });
+
+    if (isLocalModel(model)) {
+      setRun({ modelLabel: `${model.label} · on-device`, source: 'local', startedAt: now, now });
+      void local.run(payload, model);
+    } else {
+      setRun({ modelLabel: model.label, source: 'cloud', startedAt: now, now });
+      cloud.submit({ modelKey: model.key, documents: payload });
+    }
   };
 
   const exportReport = () => {
@@ -116,6 +155,8 @@ export function AnalysisDashboard({ documents, model }: AnalysisDashboardProps) 
     window.setTimeout(() => URL.revokeObjectURL(url), 0);
   };
 
+  const waitingForModel = source === 'local' && local.waitingForModel;
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <header className="flex items-center justify-between gap-3 border-b border-white/5 px-4 py-3">
@@ -128,7 +169,7 @@ export function AnalysisDashboard({ documents, model }: AnalysisDashboardProps) 
             {run ? (
               <>
                 via <span className="text-slate-300">{run.modelLabel}</span> · {elapsed}s
-                {isLoading && ` · generating ${currentSection ?? 'analysis'}…`}
+                {isLoading && (waitingForModel ? ' · loading model…' : ` · ${currentSection ?? 'starting'}…`)}
               </>
             ) : (
               'Structured, citation-grounded audit of the full bundle'
@@ -150,11 +191,19 @@ export function AnalysisDashboard({ documents, model }: AnalysisDashboardProps) 
 
       {isLoading && (
         <div className="h-0.5 w-full overflow-hidden bg-white/5">
-          <motion.div
-            className="h-full w-1/3 bg-linear-to-r from-transparent via-indigo-400 to-transparent"
-            animate={{ x: ['-100%', '300%'] }}
-            transition={{ duration: 1.4, repeat: Infinity, ease: 'easeInOut' }}
-          />
+          {source === 'local' && localProgress && localProgress.total > 0 ? (
+            <motion.div
+              className="h-full bg-linear-to-r from-emerald-400 to-cyan-300"
+              animate={{ width: `${(localProgress.done / localProgress.total) * 100}%` }}
+              transition={{ ease: 'easeOut' }}
+            />
+          ) : (
+            <motion.div
+              className="h-full w-1/3 bg-linear-to-r from-transparent via-indigo-400 to-transparent"
+              animate={{ x: ['-100%', '300%'] }}
+              transition={{ duration: 1.4, repeat: Infinity, ease: 'easeInOut' }}
+            />
+          )}
         </div>
       )}
 
@@ -168,8 +217,14 @@ export function AnalysisDashboard({ documents, model }: AnalysisDashboardProps) 
       )}
       {incomplete && !isLoading && (
         <Banner tone="warning" icon={TriangleAlert}>
-          The model’s output didn’t fully match the audit schema, so some sections may be incomplete. Re-run or try
-          another model.
+          {source === 'local' && localProgress
+            ? `${localProgress.skipped} of ${localProgress.total} on-device passes returned output that could not be parsed and were skipped. Re-run, or try a larger model.`
+            : 'The model’s output didn’t fully match the audit schema, so some sections may be incomplete. Re-run or try another model.'}
+        </Banner>
+      )}
+      {source === 'local' && localProgress?.truncated && !isLoading && (
+        <Banner tone="warning" icon={TriangleAlert}>
+          This bundle is very large: only the first {localProgress.total} passes were analysed on-device.
         </Banner>
       )}
 
@@ -237,13 +292,39 @@ export function AnalysisDashboard({ documents, model }: AnalysisDashboardProps) 
       ) : isLoading ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
           <Sparkles className="size-6 animate-pulse text-indigo-300" />
-          <p className="text-sm text-slate-300">Reading the entire bundle…</p>
-          <p className="max-w-xs text-xs text-slate-500">
-            Long-context models read every page before writing. Results stream in section by section.
-          </p>
+          {waitingForModel ? (
+            <>
+              <p className="text-sm text-slate-300">
+                Preparing the on-device model
+                {engine.progress && engine.phase === 'downloading' ? ` · ${Math.round(engine.progress.percent)}%` : '…'}
+              </p>
+              <p className="max-w-xs text-xs text-slate-500">
+                The first run downloads the model from Hugging Face into your browser cache. The audit starts automatically.
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="text-sm text-slate-300">
+                {source === 'local' ? 'Reading the bundle on your GPU…' : 'Reading the entire bundle…'}
+              </p>
+              <p className="max-w-xs text-xs text-slate-500">
+                {source === 'local'
+                  ? 'Results stream in after every pass over the document.'
+                  : 'Long-context models read every page before writing. Results stream in section by section.'}
+              </p>
+            </>
+          )}
         </div>
       ) : (
-        <AnalysisLauncher documents={documents} model={model} bundleTokens={bundleTokens} fits={fits} onStart={start} />
+        <AnalysisLauncher
+          documents={documents}
+          model={model}
+          bundleTokens={bundleTokens}
+          fits={fits}
+          passes={plan?.windows.length ?? null}
+          truncated={plan?.truncated ?? false}
+          onStart={start}
+        />
       )}
     </div>
   );
@@ -254,15 +335,20 @@ function AnalysisLauncher({
   model,
   bundleTokens,
   fits,
+  passes,
+  truncated,
   onStart,
 }: {
   documents: LoadedDocument[];
-  model: ModelOption | null;
+  model: EngineModel | null;
   bundleTokens: number;
   fits: boolean;
+  passes: number | null;
+  truncated: boolean;
   onStart: () => void;
 }) {
   const pages = documents.reduce((sum, doc) => sum + doc.pageCount, 0);
+  const local = isLocalModel(model);
 
   return (
     <div className="flex flex-1 items-center justify-center overflow-y-auto p-6">
@@ -272,24 +358,36 @@ function AnalysisLauncher({
         className="w-full max-w-md text-center"
       >
         <div className="mx-auto mb-5 grid size-14 place-items-center rounded-2xl bg-linear-to-br from-indigo-500/20 to-cyan-400/20 ring-1 ring-white/10">
-          <Sparkles className="size-6 text-indigo-300" />
+          {local ? <Lock className="size-6 text-emerald-300" /> : <Sparkles className="size-6 text-indigo-300" />}
         </div>
-        <h3 className="text-lg font-semibold text-slate-100">Run a deep audit</h3>
+        <h3 className="text-lg font-semibold text-slate-100">{local ? 'Run a private on-device audit' : 'Run a deep cloud audit'}</h3>
         <p className="mt-2 text-sm leading-relaxed text-slate-400">
-          The whole bundle goes to the model in a single long-context pass — no chunking, no lossy retrieval — so
-          conflicts between distant clauses are caught.
+          {local
+            ? 'The model reads your document in windows on your own GPU and returns a structured, page-cited report. Nothing leaves this tab.'
+            : 'The whole bundle goes to the selected cloud model in a single long-context pass, so conflicts between distant clauses are caught.'}
         </p>
 
         <dl className="mt-6 grid grid-cols-3 gap-2 text-left">
           <Stat label="Documents" value={String(documents.length)} />
           <Stat label="Pages" value={pages.toLocaleString()} />
-          <Stat label="≈ Tokens" value={formatTokens(bundleTokens)} />
+          {local ? <Stat label="Passes" value={passes === null ? '–' : String(passes)} /> : <Stat label="≈ Tokens" value={formatTokens(bundleTokens)} />}
         </dl>
 
-        {model && !fits && (
+        {isCloudModel(model) && !fits && (
           <p className="mt-4 rounded-lg border border-amber-400/20 bg-amber-400/10 px-3 py-2 text-xs text-amber-200">
             This bundle exceeds the {formatTokens(model.contextWindow)}-token context window of {model.label}. Switch to a
-            1M-token model such as Gemini 2.5 Pro or GPT-4.1.
+            1M-token model such as Gemini 2.5 Pro or GPT-4.1, or use an on-device model (it windows the text).
+          </p>
+        )}
+        {local && truncated && (
+          <p className="mt-4 rounded-lg border border-amber-400/20 bg-amber-400/10 px-3 py-2 text-xs text-amber-200">
+            Very large bundle: only the first {passes} passes will be analysed on-device.
+          </p>
+        )}
+        {isCloudModel(model) && (
+          <p className="mt-4 flex items-start gap-2 rounded-lg border border-amber-400/20 bg-amber-400/10 px-3 py-2 text-left text-xs text-amber-200">
+            <TriangleAlert className="mt-0.5 size-3.5 shrink-0" />
+            Cloud mode: the extracted text of these documents will be sent to the provider through this app’s server.
           </p>
         )}
 
@@ -299,24 +397,31 @@ function AnalysisLauncher({
           disabled={!model || !fits}
           className="mt-6 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-linear-to-r from-indigo-500 to-cyan-500 px-4 py-2.5 text-sm font-semibold text-white shadow-lg shadow-indigo-500/25 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          <Sparkles className="size-4" />
-          {model ? `Audit with ${model.label}` : 'Select a model to begin'}
+          {local ? <Lock className="size-4" /> : <Sparkles className="size-4" />}
+          {model ? `Audit with ${model.label}${local ? ' (on-device)' : ''}` : 'Select a model to begin'}
         </button>
 
         <ul className="mt-6 space-y-2 text-left text-xs text-slate-400">
           <li className="flex gap-2">
             <LayoutDashboard className="size-3.5 shrink-0 text-indigo-300" />
-            Executive summary, intent and deal architecture
+            Executive summary, intent and document structure
           </li>
           <li className="flex gap-2">
             <ShieldAlert className="size-3.5 shrink-0 text-indigo-300" />
-            Risk matrix incl. cross-clause conflicts, missing indemnities and compliance gaps
+            Risk matrix (High / Medium / Low){local ? ' plus a keyword scan for missing protections' : ', cross-clause conflicts, missing indemnities and gaps'}
           </li>
           <li className="flex gap-2">
             <CircleDollarSign className="size-3.5 shrink-0 text-indigo-300" />
             Financials, payment milestones, expiration dates and deliverables
           </li>
         </ul>
+
+        {local && (
+          <p className="mt-5 text-[11px] leading-relaxed text-slate-500">
+            Small on-device models are fast and private but less precise than frontier cloud models. Treat findings as a
+            first pass and verify against the source pages.
+          </p>
+        )}
       </motion.div>
     </div>
   );

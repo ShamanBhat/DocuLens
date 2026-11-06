@@ -9,7 +9,7 @@ const jetbrainsMono = JetBrains_Mono({ subsets: ['latin'], variable: '--font-jet
 
 export const metadata: Metadata = {
   title: {
-    default: `${APP_NAME} — AI Long-Context Document & Contract Auditor`,
+    default: `${APP_NAME} — In-Browser AI Document & Contract Auditor`,
     template: `%s · ${APP_NAME}`,
   },
   description: TAGLINE,
@@ -17,15 +17,15 @@ export const metadata: Metadata = {
   keywords: [
     'contract analysis',
     'AI document review',
-    'long-context LLM',
+    'WebGPU',
+    'Transformers.js',
+    'Hugging Face',
+    'on-device AI',
+    'privacy-first',
     'risk audit',
-    'Claude',
-    'GPT',
-    'Gemini',
-    'Vercel AI SDK',
   ],
   openGraph: {
-    title: `${APP_NAME} — AI Long-Context Document & Contract Auditor`,
+    title: `${APP_NAME} — In-Browser AI Document & Contract Auditor`,
     description: TAGLINE,
     type: 'website',
   },

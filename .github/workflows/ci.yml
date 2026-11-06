@@ -7,7 +7,13 @@ on:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    name: verify (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest is Apple Silicon (arm64): checks install, native deps and build there too.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -16,7 +22,10 @@ jobs:
           node-version: 22
 
       # Switch to `npm ci` (and add `cache: npm` above) once package-lock.json is committed.
+      # onnxruntime-node (transitive, unused in the browser) would otherwise download large CUDA binaries on Linux.
       - run: npm install
+        env:
+          ONNXRUNTIME_NODE_INSTALL_CUDA: skip
 
       - run: npm run lint
       - run: npm run typecheck

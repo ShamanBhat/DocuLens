@@ -1,43 +1,46 @@
 'use client';
 
 import { useChat } from '@ai-sdk/react';
-import { DefaultChatTransport } from 'ai';
 import { motion } from 'framer-motion';
-import { Bot, CircleAlert, CornerDownLeft, MessageSquareText, Square, Trash2 } from 'lucide-react';
+import { Bot, CircleAlert, CornerDownLeft, Lock, MessageSquareText, Square, Trash2 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
-import type { ModelOption } from '@/lib/ai/models';
+import { useLocalEngine } from '@/hooks/use-local-engine';
 import { toDocumentPayload } from '@/lib/documents/context';
+import { isLocalModel, type EngineModel } from '@/lib/engines';
+import { RoutingChatTransport } from '@/lib/local/chat-transport';
 import type { DocuLensUIMessage, LoadedDocument } from '@/lib/types';
 import { cn, formatTokens, readableError } from '@/lib/utils';
 import { MarkdownMessage } from './markdown-message';
 
-// Stateless transport — the model key and documents are attached per request.
-const transport = new DefaultChatTransport<DocuLensUIMessage>({ api: '/api/chat' });
+// One transport routes each request: `local:*` keys run in the browser worker, the rest hit /api/chat.
+const transport = new RoutingChatTransport();
 
 const SUGGESTIONS = [
   'Summarise each party’s termination rights and notice periods.',
   'Is liability capped? List every carve-out.',
-  'Which clauses conflict with each other across the bundle?',
   'List all payment obligations with amounts and due dates.',
+  'Which clauses could be unfavourable to the customer?',
 ];
 
 interface ChatSidebarProps {
   documents: LoadedDocument[];
-  model: ModelOption | null;
+  model: EngineModel | null;
 }
 
-/** Grounded Q&A over the full bundle. Switch models mid-conversation — each answer shows its model. */
+/** Grounded Q&A over the bundle. Switch between on-device and cloud models mid-conversation — each answer shows its model. */
 export function ChatSidebar({ documents, model }: ChatSidebarProps) {
   const { messages, sendMessage, status, stop, error, regenerate, setMessages } = useChat<DocuLensUIMessage>({
     transport,
     experimental_throttle: 50,
   });
+  const engine = useLocalEngine();
   const [input, setInput] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const payload = useMemo(() => toDocumentPayload(documents), [documents]);
   const busy = status === 'submitted' || status === 'streaming';
   const requestOptions = { body: { modelKey: model?.key ?? null, documents: payload } };
+  const local = isLocalModel(model);
 
   useEffect(() => {
     const element = scrollRef.current;
@@ -65,6 +68,14 @@ export function ChatSidebar({ documents, model }: ChatSidebarProps) {
 
   const lastMessage = messages.at(-1);
   const awaitingFirstToken = status === 'submitted' && lastMessage?.role === 'user';
+  const waitingNote =
+    awaitingFirstToken && local
+      ? engine.phase === 'ready'
+        ? engine.busy
+          ? 'Queued behind the running audit on your GPU…'
+          : 'Searching the document and thinking…'
+        : 'Waiting for the on-device model to finish loading…'
+      : null;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -74,10 +85,14 @@ export function ChatSidebar({ documents, model }: ChatSidebarProps) {
             <MessageSquareText className="size-4 text-indigo-300" />
             Grounded Q&amp;A
           </h2>
-          <p className="truncate text-xs text-slate-500">
+          <p className="flex items-center gap-1.5 truncate text-xs text-slate-500">
             {model ? (
               <>
-                Answering with <span className="text-slate-300">{model.label}</span>
+                {local && <Lock className="size-3 shrink-0 text-emerald-300" />}
+                <span className="truncate">
+                  Answering with <span className="text-slate-300">{model.label}</span>
+                  {local ? ' · on-device' : ' · cloud'}
+                </span>
               </>
             ) : (
               'Select a model to start'
@@ -102,7 +117,9 @@ export function ChatSidebar({ documents, model }: ChatSidebarProps) {
           <div className="flex h-full flex-col justify-center">
             <p className="text-sm font-medium text-slate-200">Ask anything about this bundle</p>
             <p className="mt-1 text-xs text-slate-500">
-              Every answer cites document, page and section — click a citation to open the source.
+              {local
+                ? 'The most relevant pages are searched locally and fed to the on-device model. Every answer cites document and page.'
+                : 'Every answer cites document, page and section — click a citation to open the source.'}
             </p>
             <div className="mt-4 space-y-2">
               {SUGGESTIONS.map((suggestion) => (
@@ -141,6 +158,7 @@ export function ChatSidebar({ documents, model }: ChatSidebarProps) {
                 />
               ))}
             </div>
+            {waitingNote && <span className="text-xs text-slate-500">{waitingNote}</span>}
           </div>
         )}
 
@@ -193,7 +211,9 @@ export function ChatSidebar({ documents, model }: ChatSidebarProps) {
           )}
         </div>
         <p className="mt-2 text-[10px] text-slate-500">
-          Grounded in your documents only. AI can make mistakes — verify critical findings against the source.
+          {local
+            ? 'Private: runs on your device. Small models can make mistakes — verify against the cited pages.'
+            : 'Cloud mode: your question and the document text are sent to the provider. AI can make mistakes — verify citations.'}
         </p>
       </form>
     </div>
